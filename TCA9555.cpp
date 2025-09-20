@@ -9,6 +9,10 @@
 
 #include "TCA9555.h"
 
+// Static member definitions
+TCA9555* TCA9555::_instances[8] = {nullptr};
+uint8_t TCA9555::_instanceCount = 0;
+
 
 //  REGISTERS P23-24
 #define TCA9555_INPUT_PORT_REGISTER_0     0x00    //  read()
@@ -27,6 +31,20 @@ TCA9555::TCA9555(uint8_t address, TwoWire *wire)
   _wire    = wire;
   _error   = TCA9555_OK;
   _type    = 55;
+  
+  // Initialize interrupt handling members
+  _interruptPin = 255;  // Invalid pin
+  _interruptEnabled = false;
+  _lastState = 0;
+  _currentState = 0;
+  _interruptFlag = false;
+  _globalCallback = nullptr;
+  _instanceIndex = 255;  // Invalid index
+  
+  // Clear pin callbacks
+  for (uint8_t i = 0; i < 16; i++) {
+    _pinCallbacks[i] = nullptr;
+  }
 }
 
 
@@ -342,6 +360,213 @@ uint8_t TCA9555::getType()
 {
   return _type;
 }
+
+
+////////////////////////////////////////////////////
+//
+//  DEBUG
+//
+void TCA9555::debugPrintGPIOs()
+{
+  uint16_t inputValues = read16();
+  
+  Serial.println("=== TCA9555 GPIO Status ===");
+  Serial.print("Address: 0x");
+  Serial.println(_address, HEX);
+  Serial.print("Type: TCA");
+  Serial.println(_type);
+  Serial.println("PIN | PORT | STATE");
+  Serial.println("----|------|------");
+  
+  for (uint8_t pin = 0; pin < 16; pin++)
+  {
+    uint8_t port = (pin < 8) ? 0 : 1;
+    uint8_t localPin = (pin < 8) ? pin : pin - 8;
+    bool state = (inputValues & (1 << pin)) ? true : false;
+    
+    Serial.print("P");
+    Serial.print(port);
+    Serial.print(localPin);
+    Serial.print(" |  ");
+    Serial.print(port);
+    Serial.print("   |  ");
+    Serial.println(state ? "HIGH" : "LOW");
+  }
+  
+  Serial.print("Port 0 (P00-P07): 0b");
+  Serial.print(inputValues & 0xFF, BIN);
+  Serial.print(" (0x");
+  Serial.print(inputValues & 0xFF, HEX);
+  Serial.println(")");
+  
+  Serial.print("Port 1 (P10-P17): 0b");
+  Serial.print((inputValues >> 8) & 0xFF, BIN);
+  Serial.print(" (0x");
+  Serial.print((inputValues >> 8) & 0xFF, HEX);
+  Serial.println(")");
+  
+  Serial.print("All 16 pins: 0b");
+  Serial.print(inputValues, BIN);
+  Serial.print(" (0x");
+  Serial.print(inputValues, HEX);
+  Serial.println(")");
+  Serial.println("===========================");
+}
+
+
+////////////////////////////////////////////////////
+//
+//  INTERRUPT HANDLING
+//
+bool TCA9555::enableInterrupt(uint8_t interruptPin, TCA9555_Callback callback)
+{
+  if (_instanceCount >= 8) {
+    _error = TCA9555_VALUE_ERROR;
+    return false;
+  }
+  
+  // Find an available instance slot
+  for (uint8_t i = 0; i < 8; i++) {
+    if (_instances[i] == nullptr) {
+      _instances[i] = this;
+      _instanceIndex = i;
+      break;
+    }
+  }
+  
+  if (_instanceIndex == 255) {
+    _error = TCA9555_VALUE_ERROR;
+    return false;
+  }
+  
+  _instanceCount++;
+  _interruptPin = interruptPin;
+  _globalCallback = callback;
+  _interruptEnabled = true;
+  
+  // Read initial state
+  _lastState = read16();
+  _currentState = _lastState;
+  
+  // Configure interrupt pin
+  pinMode(_interruptPin, INPUT_PULLUP);
+  
+  // Attach appropriate ISR based on instance index
+  switch (_instanceIndex) {
+    case 0: attachInterrupt(digitalPinToInterrupt(_interruptPin), _handleISR0, FALLING); break;
+    case 1: attachInterrupt(digitalPinToInterrupt(_interruptPin), _handleISR1, FALLING); break;
+    case 2: attachInterrupt(digitalPinToInterrupt(_interruptPin), _handleISR2, FALLING); break;
+    case 3: attachInterrupt(digitalPinToInterrupt(_interruptPin), _handleISR3, FALLING); break;
+    case 4: attachInterrupt(digitalPinToInterrupt(_interruptPin), _handleISR4, FALLING); break;
+    case 5: attachInterrupt(digitalPinToInterrupt(_interruptPin), _handleISR5, FALLING); break;
+    case 6: attachInterrupt(digitalPinToInterrupt(_interruptPin), _handleISR6, FALLING); break;
+    case 7: attachInterrupt(digitalPinToInterrupt(_interruptPin), _handleISR7, FALLING); break;
+  }
+  
+  _error = TCA9555_OK;
+  return true;
+}
+
+void TCA9555::disableInterrupt()
+{
+  if (_interruptEnabled && _interruptPin != 255) {
+    detachInterrupt(digitalPinToInterrupt(_interruptPin));
+    _interruptEnabled = false;
+    
+    // Clear instance from array
+    if (_instanceIndex < 8) {
+      _instances[_instanceIndex] = nullptr;
+      _instanceCount--;
+    }
+    
+    _interruptPin = 255;
+    _instanceIndex = 255;
+  }
+}
+
+void TCA9555::handleInterrupt()
+{
+  // This is called from ISR context - keep it as short as possible!
+  // Only set a flag, don't do any I2C communication or heavy operations
+  _interruptFlag = true;
+}
+
+bool TCA9555::processInterrupt()
+{
+  // This method should be called from the main loop to process pending interrupts
+  if (!_interruptFlag || !_interruptEnabled) {
+    return false;
+  }
+  
+  // Clear the flag first
+  _interruptFlag = false;
+  
+  // Now do the heavy work (I2C communication) in main loop context
+  _currentState = read16();
+  
+  // Find changed pins
+  uint16_t changedPins = _currentState ^ _lastState;
+  
+  if (changedPins == 0) {
+    return false; // No actual changes
+  }
+  
+  // Call callbacks for changed pins
+  for (uint8_t pin = 0; pin < 16; pin++) {
+    if (changedPins & (1 << pin)) {
+      uint8_t currentPinState = (_currentState >> pin) & 0x01;
+      
+      // Call pin-specific callback if set
+      if (_pinCallbacks[pin] != nullptr) {
+        _pinCallbacks[pin](pin, currentPinState, _currentState);
+      }
+      
+      // Call global callback if set
+      if (_globalCallback != nullptr) {
+        _globalCallback(pin, currentPinState, _currentState);
+      }
+    }
+  }
+  
+  // Update last state
+  _lastState = _currentState;
+  
+  return true; // Interrupt was processed
+}
+
+void TCA9555::setPinCallback(uint8_t pin, TCA9555_Callback callback)
+{
+  if (pin < 16) {
+    _pinCallbacks[pin] = callback;
+  }
+}
+
+void TCA9555::setGlobalCallback(TCA9555_Callback callback)
+{
+  _globalCallback = callback;
+}
+
+uint16_t TCA9555::getLastInterruptState()
+{
+  return _lastState;
+}
+
+uint16_t TCA9555::getCurrentState()
+{
+  // Always read fresh state from the chip
+  _currentState = read16();
+  return _currentState;
+}
+
+// Static ISR handlers
+void TCA9555::_handleISR0() { if (_instances[0]) _instances[0]->handleInterrupt(); }
+void TCA9555::_handleISR1() { if (_instances[1]) _instances[1]->handleInterrupt(); }
+void TCA9555::_handleISR2() { if (_instances[2]) _instances[2]->handleInterrupt(); }
+void TCA9555::_handleISR3() { if (_instances[3]) _instances[3]->handleInterrupt(); }
+void TCA9555::_handleISR4() { if (_instances[4]) _instances[4]->handleInterrupt(); }
+void TCA9555::_handleISR5() { if (_instances[5]) _instances[5]->handleInterrupt(); }
+void TCA9555::_handleISR6() { if (_instances[6]) _instances[6]->handleInterrupt(); }
+void TCA9555::_handleISR7() { if (_instances[7]) _instances[7]->handleInterrupt(); }
 
 
 ////////////////////////////////////////////////////

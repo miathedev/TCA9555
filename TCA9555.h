@@ -11,6 +11,9 @@
 #include "Arduino.h"
 #include "Wire.h"
 
+// Callback function type for interrupt handling
+typedef void (*TCA9555_Callback)(uint8_t pin, uint8_t state, uint16_t allPins);
+
 
 #define TCA9555_LIB_VERSION               (F("0.4.3"))
 
@@ -94,6 +97,19 @@ public:
   int      lastError();
   uint8_t  getType();
 
+  //  DEBUG
+  void     debugPrintGPIOs();
+
+  //  INTERRUPT HANDLING
+  bool     enableInterrupt(uint8_t interruptPin, TCA9555_Callback callback = nullptr);
+  void     disableInterrupt();
+  void     handleInterrupt();
+  bool     processInterrupt();  // New method to process interrupt in main loop
+  void     setPinCallback(uint8_t pin, TCA9555_Callback callback);
+  void     setGlobalCallback(TCA9555_Callback callback);
+  uint16_t getLastInterruptState();
+  uint16_t getCurrentState();
+
 
 protected:
   bool     writeRegister(uint8_t reg, uint8_t value);
@@ -103,6 +119,28 @@ protected:
   TwoWire* _wire;
   uint8_t  _error;
   uint8_t  _type;
+  
+  // Interrupt handling members
+  uint8_t  _interruptPin;
+  bool     _interruptEnabled;
+  uint16_t _lastState;
+  uint16_t _currentState;
+  volatile bool _interruptFlag;  // Flag set by ISR
+  TCA9555_Callback _globalCallback;
+  TCA9555_Callback _pinCallbacks[16];
+  
+  // Static members for ISR handling
+  static TCA9555* _instances[8];  // Support up to 8 TCA9555 instances
+  static uint8_t  _instanceCount;
+  static void     _handleISR0();
+  static void     _handleISR1();
+  static void     _handleISR2();
+  static void     _handleISR3();
+  static void     _handleISR4();
+  static void     _handleISR5();
+  static void     _handleISR6();
+  static void     _handleISR7();
+  uint8_t         _instanceIndex;
 };
 
 
